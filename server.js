@@ -183,6 +183,12 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.get("/api/bookings/:id", (req, res) => {
+  const booking = bookings.get(req.params.id);
+  if (!booking) return res.status(404).json({ error: "Booking introuvable" });
+  res.json(booking);
+});
+
 // 1) Création de booking + génération URL de paiement
 app.post("/api/bookings", async (req, res) => {
   try {
