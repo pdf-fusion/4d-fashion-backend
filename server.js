@@ -171,7 +171,16 @@ async function createBancontactCheckout({ bookingId, amount, currency, descripti
 
 // Route simple de test
 app.get("/", (req, res) => {
-  res.send("4D Fashion Booking API en ligne 🚀");
+  res.send("4D Fashion Services Booking API en ligne 🚀");
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    apiBase: API_BASE || null,
+    paypalConfigured: Boolean(PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET && PAYPAL_API_BASE),
+    stripeConfigured: Boolean(STRIPE_SECRET_KEY),
+  });
 });
 
 // 1) Création de booking + génération URL de paiement
