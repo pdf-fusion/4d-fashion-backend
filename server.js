@@ -189,6 +189,9 @@ app.get("/api/bookings/:id", (req, res) => {
   res.json(booking);
 });
 
+app.get("/success", (req, res) => res.send("Paiement OK ✅"));
+app.get("/cancel", (req, res) => res.send("Paiement annulé ❌"));
+
 // 1) Création de booking + génération URL de paiement
 app.post("/api/bookings", async (req, res) => {
   try {
