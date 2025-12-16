@@ -7,11 +7,20 @@ dotenv.config();
 
 const app = express();
 
-// ---------------------------------------------------------
-// 0) Stripe webhook MUST use raw body (before express.json)
-// ---------------------------------------------------------
+/** =========================================================
+ *  0) Stripe webhook MUST use raw body BEFORE express.json()
+ *  ========================================================= */
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+
+const bookings = new Map();
+
+const BookingStatus = {
+  PENDING_DEPOSIT: "PENDING_DEPOSIT",
+  CONFIRMED: "CONFIRMED",
+  CANCELLED: "CANCELLED",
+  NO_SHOW: "NO_SHOW",
+};
 
 app.post(
   "/payments/webhook/stripe",
@@ -23,9 +32,7 @@ app.post(
       const sig = req.headers["stripe-signature"];
       const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-      if (!webhookSecret) {
-        return res.status(500).send("Missing STRIPE_WEBHOOK_SECRET");
-      }
+      if (!webhookSecret) return res.status(500).send("Missing STRIPE_WEBHOOK_SECRET");
 
       let event;
       try {
@@ -35,7 +42,6 @@ app.post(
         return res.status(400).send(`Webhook Error: ${err.message}`);
       }
 
-      // Handle event types
       if (event.type === "checkout.session.completed") {
         const session = event.data.object;
         const bookingId = session.metadata?.bookingId;
@@ -46,7 +52,6 @@ app.post(
           booking.status = BookingStatus.CONFIRMED;
           booking.updatedAt = new Date().toISOString();
           bookings.set(bookingId, booking);
-
           console.log("✅ Booking confirmé via Stripe (Bancontact):", bookingId);
         } else {
           console.warn("⚠️ BookingId introuvable dans webhook:", bookingId);
@@ -61,18 +66,16 @@ app.post(
   }
 );
 
-// Après webhook : JSON pour toutes les autres routes
+// JSON pour toutes les autres routes
 app.use(express.json());
 
-// ---------------------------------------------------------
-// 1) Config
-// ---------------------------------------------------------
+/** =========================================================
+ *  1) Config générale
+ *  ========================================================= */
 const PORT = process.env.PORT || 4000;
 
-// URL publique de ton API (Render)
 const API_BASE = (process.env.API_BASE || "").replace(/\/+$/, "");
 
-// PayPal
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || "";
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || "";
 const PAYPAL_API_BASE = (process.env.PAYPAL_API_BASE || "https://api-m.sandbox.paypal.com").replace(
@@ -80,25 +83,54 @@ const PAYPAL_API_BASE = (process.env.PAYPAL_API_BASE || "https://api-m.sandbox.p
   ""
 );
 
-// Front URLs (utilisées par Stripe Checkout)
 const FRONTEND_SUCCESS_URL = (process.env.FRONTEND_SUCCESS_URL || "").replace(/\/+$/, "");
 const FRONTEND_CANCEL_URL = (process.env.FRONTEND_CANCEL_URL || "").replace(/\/+$/, "");
 
-// ---------------------------------------------------------
-// 2) "DB" en mémoire
-// ---------------------------------------------------------
-const bookings = new Map();
+/** =========================================================
+ *  2) Services salon + prix (PRO)
+ *  - ici tu mets ta vraie carte de services
+ *  ========================================================= */
+const services = [
+  // Tresses / Braids
+  { id: "BRAIDS_SMALL", name: "Tresses Small", category: "Coiffure femme africaine", priceEur: 120, durationMinutes: 180 },
+  { id: "BRAIDS_MEDIUM", name: "Tresses Medium", category: "Coiffure femme africaine", priceEur: 80, durationMinutes: 150 },
+  { id: "BRAIDS_LARGE", name: "Tresses Large", category: "Coiffure femme africaine", priceEur: 60, durationMinutes: 120 },
 
-const BookingStatus = {
-  PENDING_DEPOSIT: "PENDING_DEPOSIT",
-  CONFIRMED: "CONFIRMED",
-  CANCELLED: "CANCELLED",
-  NO_SHOW: "NO_SHOW",
-};
+  // Dreadlocks
+  { id: "DREADLOCKS", name: "Dreadlocks", category: "Coiffure", priceEur: 120, durationMinutes: 180 },
 
-// ---------------------------------------------------------
-// 3) Helpers PayPal
-// ---------------------------------------------------------
+  // Perruques / Locks
+  { id: "WIG_INSTALL", name: "Pose Perruque", category: "Coiffure", priceEur: 70, durationMinutes: 90 },
+  { id: "LOCKS_RETOUCH", name: "Retouche Locks", category: "Coiffure", priceEur: 65, durationMinutes: 90 },
+
+  // Lissage / Coloration / Soins
+  { id: "HAIR_STRAIGHTENING", name: "Lissage de cheveux", category: "Soins capillaires", priceEur: 90, durationMinutes: 120 }, // À CONFIRMER
+  { id: "HAIR_COLORING", name: "Coloration capillaire", category: "Coloration", priceEur: 85, durationMinutes: 120 }, // À CONFIRMER
+  { id: "SHAMPOO", name: "Shampoing", category: "Soins capillaires", priceEur: 15, durationMinutes: 30 }, // À CONFIRMER
+
+  // Coupes
+  { id: "KIDS_CUT", name: "Coupe enfants", category: "Coupe", priceEur: 10, durationMinutes: 30 },
+  { id: "MEN_CUT", name: "Coupe hommes", category: "Coupe", priceEur: 15, durationMinutes: 30 },
+
+  // Brushing
+  { id: "SILK_PRESS", name: "Brushing / Silk Press", category: "Brushing", priceEur: 50, durationMinutes: 60 }
+];   
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+function assertValidUrl(u, name) {
+  try {
+    new URL(u);
+  } catch {
+    throw new Error(`${name} is not a valid URL`);
+  }
+}
+
+/** =========================================================
+ *  3) PayPal helpers
+ *  ========================================================= */
 async function getPayPalAccessToken() {
   if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
     throw new Error("PayPal not configured (missing client id/secret)");
@@ -143,10 +175,7 @@ async function createPayPalOrder({ bookingId, amount, currency }) {
       purchase_units: [
         {
           reference_id: bookingId,
-          amount: {
-            currency_code: currency,
-            value: amount.toFixed(2),
-          },
+          amount: { currency_code: currency, value: amount.toFixed(2) },
         },
       ],
       application_context: {
@@ -165,10 +194,7 @@ async function createPayPalOrder({ bookingId, amount, currency }) {
 
   const data = await res.json();
   const approveLink = data.links?.find((l) => l.rel === "approve")?.href;
-
-  if (!approveLink) {
-    throw new Error("PayPal: lien approve introuvable");
-  }
+  if (!approveLink) throw new Error("PayPal: lien approve introuvable");
 
   return { orderId: data.id, approveUrl: approveLink };
 }
@@ -178,10 +204,7 @@ async function capturePayPalOrder(orderId) {
 
   const res = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${orderId}/capture`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
   });
 
   if (!res.ok) {
@@ -192,22 +215,12 @@ async function capturePayPalOrder(orderId) {
   return res.json();
 }
 
-// ---------------------------------------------------------
-// 4) Helper Stripe Bancontact
-// ---------------------------------------------------------
-function assertValidUrl(u, name) {
-  try {
-    // throws if invalid
-    new URL(u);
-  } catch {
-    throw new Error(`${name} is not a valid URL`);
-  }
-}
-
+/** =========================================================
+ *  4) Stripe Bancontact helper
+ *  ========================================================= */
 async function createBancontactCheckout({ bookingId, amount, currency, description }) {
   if (!stripe) throw new Error("Stripe not configured (missing STRIPE_SECRET_KEY)");
 
-  // Stripe requires absolute valid URLs
   assertValidUrl(FRONTEND_SUCCESS_URL, "FRONTEND_SUCCESS_URL");
   assertValidUrl(FRONTEND_CANCEL_URL, "FRONTEND_CANCEL_URL");
 
@@ -222,7 +235,7 @@ async function createBancontactCheckout({ bookingId, amount, currency, descripti
         quantity: 1,
         price_data: {
           currency: currency.toLowerCase(),
-          unit_amount: Math.round(amount * 100), // cents
+          unit_amount: Math.round(amount * 100),
           product_data: { name: description || "Acompte RDV - 4D Fashion" },
         },
       },
@@ -235,9 +248,9 @@ async function createBancontactCheckout({ bookingId, amount, currency, descripti
   return { sessionId: session.id, url: session.url };
 }
 
-// ---------------------------------------------------------
-// 5) Routes de base
-// ---------------------------------------------------------
+/** =========================================================
+ *  5) Routes UI/diagnostic
+ *  ========================================================= */
 app.get("/", (req, res) => res.send("4D Fashion Booking API en ligne 🚀"));
 
 app.get("/success", (req, res) => res.send("Paiement OK ✅"));
@@ -252,17 +265,25 @@ app.get("/health", (req, res) => {
     webhookConfigured: Boolean(process.env.STRIPE_WEBHOOK_SECRET),
     frontendSuccessUrl: FRONTEND_SUCCESS_URL || null,
     frontendCancelUrl: FRONTEND_CANCEL_URL || null,
+    servicesCount: services.length,
   });
 });
 
-// ---------------------------------------------------------
-// 6) API Bookings
-// ---------------------------------------------------------
+/** =========================================================
+ *  6) API services
+ *  ========================================================= */
+app.get("/api/services", (req, res) => {
+  res.json(services);
+});
+
+/** =========================================================
+ *  7) API booking (acompte = 20% du service)
+ *  - PRO: backend impose prix + acompte, pas l'app
+ *  ========================================================= */
 app.post("/api/bookings", async (req, res) => {
   try {
     const body = req.body;
 
-    // validations minimales
     if (!body.customer?.firstName || !body.customer?.phoneNumber) {
       return res.status(400).json({ error: "Customer (prénom + téléphone) requis" });
     }
@@ -272,9 +293,17 @@ app.post("/api/bookings", async (req, res) => {
     if (!body.paymentMethod) {
       return res.status(400).json({ error: "paymentMethod requis (PAYPAL ou BANCONTACT)" });
     }
-    if (typeof body.depositRequiredEur !== "number" || body.depositRequiredEur <= 0) {
-      return res.status(400).json({ error: "depositRequiredEur doit être un nombre > 0" });
+    if (!body.serviceId) {
+      return res.status(400).json({ error: "serviceId requis" });
     }
+
+    const service = services.find((s) => s.id === body.serviceId);
+    if (!service) {
+      return res.status(400).json({ error: "Service invalide" });
+    }
+
+    const totalPriceEur = round2(service.priceEur);
+    const depositRequiredEur = round2(totalPriceEur * 0.20); // ✅ 20%
 
     const bookingId = `BKG-${Date.now()}`;
 
@@ -283,16 +312,24 @@ app.post("/api/bookings", async (req, res) => {
       salonName: "4D FASHION SERVICES SRL",
       salonAddress: "RUE DES CAPUCINS 64, 7000 MONS, BELGIQUE",
       salonId: body.salonId || "4D-FASHION-SERVICES-SRL",
+
       customer: body.customer,
-      serviceId: body.serviceId || "UNKNOWN_SERVICE",
+      serviceId: service.id,
+      serviceName: service.name,
+      servicePriceEur: totalPriceEur,
+      serviceDurationMinutes: service.durationMinutes,
+
       hairProfile: body.hairProfile || null,
       appointmentDateTime: body.appointmentDateTime,
-      totalPriceEur: body.totalPriceEur ?? null,
-      depositRequiredEur: body.depositRequiredEur,
+
+      totalPriceEur,
+      depositRequiredEur,
+
       depositPaid: false,
       status: BookingStatus.PENDING_DEPOSIT,
       paymentMethod: body.paymentMethod,
       notesForStylist: body.notesForStylist ?? null,
+
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -302,26 +339,28 @@ app.post("/api/bookings", async (req, res) => {
     let paymentUrl = null;
 
     if (body.paymentMethod === "PAYPAL") {
-      const paypalOrder = await createPayPalOrder({
+      const order = await createPayPalOrder({
         bookingId,
-        amount: body.depositRequiredEur,
+        amount: depositRequiredEur,
         currency: "EUR",
       });
 
-      booking.paypalOrderId = paypalOrder.orderId;
+      booking.paypalOrderId = order.orderId;
       bookings.set(bookingId, booking);
-      paymentUrl = paypalOrder.approveUrl;
+      paymentUrl = order.approveUrl;
+
     } else if (body.paymentMethod === "BANCONTACT") {
       const session = await createBancontactCheckout({
         bookingId,
-        amount: body.depositRequiredEur,
+        amount: depositRequiredEur,
         currency: "EUR",
-        description: "Acompte rendez-vous 4D Fashion Services",
+        description: `Acompte (20%) - ${service.name}`,
       });
 
       booking.bancontactSessionId = session.sessionId;
       bookings.set(bookingId, booking);
       paymentUrl = session.url;
+
     } else {
       return res.status(400).json({ error: "paymentMethod invalide. Utilise PAYPAL ou BANCONTACT." });
     }
@@ -331,6 +370,8 @@ app.post("/api/bookings", async (req, res) => {
       status: booking.status,
       paymentUrl,
       message: "Booking créé, acompte en attente de paiement",
+      totalPriceEur,
+      depositRequiredEur
     });
   } catch (err) {
     console.error("Erreur /api/bookings:", err);
@@ -341,23 +382,21 @@ app.post("/api/bookings", async (req, res) => {
   }
 });
 
-// Lire un booking (utile pour vérifier CONFIRMED)
 app.get("/api/bookings/:id", (req, res) => {
   const booking = bookings.get(req.params.id);
   if (!booking) return res.status(404).json({ error: "Booking introuvable" });
   return res.json(booking);
 });
 
-// ---------------------------------------------------------
-// 7) PayPal return/cancel
-// ---------------------------------------------------------
+/** =========================================================
+ *  8) PayPal return/cancel
+ *  ========================================================= */
 app.get("/payments/paypal/return", async (req, res) => {
   try {
     const bookingId = req.query.bookingId;
-    const token = req.query.token; // orderId PayPal
+    const token = req.query.token;
 
     if (!bookingId || !token) return res.status(400).send("Paramètres manquants");
-
     const booking = bookings.get(bookingId);
     if (!booking) return res.status(404).send("Booking introuvable");
 
@@ -369,10 +408,7 @@ app.get("/payments/paypal/return", async (req, res) => {
       booking.updatedAt = new Date().toISOString();
       bookings.set(bookingId, booking);
 
-      // Redirige vers page succès (front)
-      const redirectUrl = `${FRONTEND_SUCCESS_URL || API_BASE + "/success"}?bookingId=${encodeURIComponent(
-        bookingId
-      )}`;
+      const redirectUrl = `${FRONTEND_SUCCESS_URL || API_BASE + "/success"}?bookingId=${encodeURIComponent(bookingId)}`;
       return res.redirect(302, redirectUrl);
     }
 
@@ -380,9 +416,7 @@ app.get("/payments/paypal/return", async (req, res) => {
     booking.updatedAt = new Date().toISOString();
     bookings.set(bookingId, booking);
 
-    const redirectUrl = `${FRONTEND_CANCEL_URL || API_BASE + "/cancel"}?bookingId=${encodeURIComponent(
-      bookingId
-    )}`;
+    const redirectUrl = `${FRONTEND_CANCEL_URL || API_BASE + "/cancel"}?bookingId=${encodeURIComponent(bookingId)}`;
     return res.redirect(302, redirectUrl);
   } catch (err) {
     console.error("Erreur /payments/paypal/return:", err);
@@ -400,13 +434,10 @@ app.get("/payments/paypal/cancel", (req, res) => {
     bookings.set(bookingId, booking);
   }
 
-  const redirectUrl = `${FRONTEND_CANCEL_URL || API_BASE + "/cancel"}?bookingId=${encodeURIComponent(
-    bookingId || ""
-  )}`;
+  const redirectUrl = `${FRONTEND_CANCEL_URL || API_BASE + "/cancel"}?bookingId=${encodeURIComponent(bookingId || "")}`;
   return res.redirect(302, redirectUrl);
 });
 
-// ---------------------------------------------------------
 app.listen(PORT, () => {
   console.log(`4D Fashion Booking API running on port ${PORT}`);
 });
