@@ -381,7 +381,16 @@ app.get("/health", async (req, res) => {
 
 // services list
 app.get("/api/services", async (req, res) => {
-  const { rows } = await pool.query("SELECT id, name, category, price_eur AS \"priceEur\", duration_minutes AS \"durationMinutes\" FROM services ORDER BY name ASC");
+  const { rows } = await pool.query(
+    `SELECT 
+        id, 
+        name, 
+        category, 
+        price_eur::float8 AS "priceEur", 
+        duration_minutes AS "durationMinutes"
+     FROM services
+     ORDER BY name ASC`
+  );
   res.json(rows);
 });
 
@@ -431,14 +440,15 @@ app.post("/api/bookings", async (req, res) => {
       return res.status(400).json({ error: "paymentMethod invalide. Utilise PAYPAL ou BANCONTACT." });
     }
 
-    return res.status(201).json({
-      bookingId,
-      status: BookingStatus.PENDING_DEPOSIT,
-      paymentUrl,
-      totalPriceEur,
-      depositRequiredEur,
-      message: "Booking créé, acompte en attente de paiement",
-    });
+return res.status(201).json({
+  bookingId,
+  status: BookingStatus.PENDING_DEPOSIT,
+  paymentUrl,
+  totalPriceEur: Number(totalPriceEur),
+  depositRequiredEur: Number(depositRequiredEur),
+  message: "Booking créé, acompte en attente de paiement",
+});
+
   } catch (e) {
     console.error("create booking error:", e);
     res.status(500).json({ error: "Erreur serveur", details: e.message });
@@ -448,11 +458,15 @@ app.post("/api/bookings", async (req, res) => {
 // get booking
 app.get("/api/bookings/:id", async (req, res) => {
   const { rows } = await pool.query(
-    `SELECT b.id, b.status, b.deposit_paid AS "depositPaid",
-            b.total_price_eur AS "totalPriceEur", b.deposit_required_eur AS "depositRequiredEur",
-            b.payment_method AS "paymentMethod",
-            b.appointment_at AS "appointmentAt"
-     FROM bookings b WHERE b.id=$1`,
+    `SELECT 
+  b.id,
+  b.status,
+  b.deposit_paid AS "depositPaid",
+  b.total_price_eur::float8 AS "totalPriceEur",
+  b.deposit_required_eur::float8 AS "depositRequiredEur",
+  b.payment_method AS "paymentMethod"
+FROM bookings b
+WHERE b.id=$1`,
     [req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: "Booking introuvable" });
