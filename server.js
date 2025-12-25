@@ -389,6 +389,7 @@ app.get("/api/services", async (req, res) => {
         price_eur::float8 AS "priceEur", 
         duration_minutes AS "durationMinutes"
      FROM services
+     WHERE is_active = TRUE
      ORDER BY name ASC`
   );
   res.json(rows);
