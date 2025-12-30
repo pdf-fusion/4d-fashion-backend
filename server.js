@@ -741,10 +741,9 @@ color:var(--bg);font-weight:800;text-decoration:none;display:inline-block;box-sh
       <div class="row"><div class="k">Statut</div><div class="v">${status}</div></div>
       <div class="row"><div class="k">Téléphone</div><div class="v">${phone}</div></div>
 
-      <div class="btns">
-        <a class="btn" href="${deepLink}" onclick="openApp(event)">Retour à l’application</a>
-        <a class="btn secondary" href="/api/bookings/${encodeURIComponent(bookingId || "")}">Voir statut (JSON)</a>
-      </div>
+<div class="btns">
+  <a class="btn" href="${deepLink}" onclick="openApp(event)">Retour à l’application</a>
+</div>
 
       <div class="note">Vous recevrez un SMS de rappel 24h et 5h avant votre rendez-vous.</div>
     </div>
@@ -812,10 +811,10 @@ color:var(--bg);font-weight:800;text-decoration:none;display:inline-block;}
   <div class="row"><div class="k">Prestation</div><div class="v">${serviceName}</div></div>
   <div class="row"><div class="k">Date & heure</div><div class="v">${escapeHtml(appointment)}</div></div>
 
-  <div class="btns">
-    <a class="btn" href="${deepLink}" onclick="openApp(event)">Retour à l’application</a>
-    ${bookingId ? `<a class="btn secondary" href="/api/bookings/${encodeURIComponent(bookingId)}">Voir statut (JSON)</a>` : ""}
-  </div>
+<div class="btns">
+  <a class="btn" href="${deepLink}" onclick="openApp(event)">Retour à l’application</a>
+</div>
+
 </div></div>
 
 <script>
