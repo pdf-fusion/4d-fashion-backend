@@ -1,4 +1,3 @@
-
 import express from "express";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
@@ -53,10 +52,10 @@ const PAYPAL_API_BASE = (process.env.PAYPAL_API_BASE || "https://api-m.sandbox.p
   ""
 );
 
-// Admin API token (optional for later)
+// Admin API token (optional)
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 
-// App link (deep link scheme)
+// Deep link scheme
 const APP_DEEP_LINK_SCHEME = "4dfashion://booking?bookingId=";
 
 // Play Store fallback (optional)
@@ -92,9 +91,7 @@ app.post("/payments/webhook/stripe", express.raw({ type: "application/json" }), 
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
       const bookingId = session.metadata?.bookingId;
-      if (bookingId) {
-        await markBookingConfirmed(bookingId, { stripeSessionId: session.id });
-      }
+      if (bookingId) await markBookingConfirmed(bookingId, { stripeSessionId: session.id });
     }
 
     return res.json({ received: true });
@@ -120,6 +117,16 @@ function assertValidUrl(u, name) {
   } catch {
     throw new Error(`${name} is not a valid URL`);
   }
+}
+
+// ✅ Normalise BE phone to E.164 for Twilio (0486... -> +32486...)
+function normalizeBePhone(phoneRaw) {
+  const p = String(phoneRaw || "").trim().replace(/\s+/g, "");
+  if (!p) return "";
+  if (p.startsWith("+")) return p; // already E.164
+  if (p.startsWith("00")) return "+" + p.slice(2); // 00xx -> +xx
+  if (p.startsWith("0")) return "+32" + p.slice(1); // 0xxxx -> +32xxxx
+  return p;
 }
 
 function escapeHtml(str = "") {
@@ -148,7 +155,6 @@ function moneyEUR(v) {
 
 /** =========================================================
  *  6) Services seed (optional – upsert on start)
- *  IMPORTANT: if you don’t want auto-upsert, comment it out.
  *  ========================================================= */
 const SERVICE_SEED = [
   { id: "DREADLOCKS", name: "Dreadlocks", category: "Coiffure", priceEur: 120.0, durationMinutes: 180 },
@@ -162,18 +168,20 @@ const SERVICE_SEED = [
   { id: "WIG_INSTALL", name: "Pose Perruque", category: "Coiffure", priceEur: 70.0, durationMinutes: 90 },
   { id: "LOCKS_RETOUCH", name: "Retouche Locks", category: "Coiffure", priceEur: 65.0, durationMinutes: 90 },
 
-  // Nouveau service demandé
   { id: "BRAIDS_RETOUCH_MEN", name: "Retouche tresse homme", category: "Coiffure", priceEur: 2.5, durationMinutes: 15 },
 ];
+
+async function ensureDbColumns() {
+  // services.is_active
+  await pool.query("ALTER TABLE services ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;");
+  // sms_jobs.error
+  await pool.query("ALTER TABLE sms_jobs ADD COLUMN IF NOT EXISTS error TEXT;");
+}
 
 async function upsertServices() {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    // assure colonne is_active si tu as choisi la stratégie "désactiver"
-    await client.query(
-      "ALTER TABLE services ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;"
-    );
 
     for (const s of SERVICE_SEED) {
       await client.query(
@@ -284,15 +292,30 @@ async function createBancontactCheckout({ bookingId, amount }) {
  *  9) Core DB actions
  *  ========================================================= */
 async function getOrCreateCustomer({ firstName, lastName, phoneNumber, email }) {
+  const phone = normalizeBePhone(phoneNumber);
+
   const client = await pool.connect();
   try {
-    const existing = await client.query("SELECT id FROM customers WHERE phone=$1", [phoneNumber]);
-    if (existing.rowCount > 0) return existing.rows[0].id;
+    // cherche avec phone normalisé OU ancien format (si déjà en DB)
+    const existing = await client.query("SELECT id, phone FROM customers WHERE phone=$1 OR phone=$2 LIMIT 1", [
+      phone,
+      phoneNumber,
+    ]);
+
+    if (existing.rowCount > 0) {
+      const id = existing.rows[0].id;
+      const storedPhone = existing.rows[0].phone;
+      // si l’ancien format est stocké, on le corrige
+      if (storedPhone !== phone) {
+        await client.query("UPDATE customers SET phone=$2 WHERE id=$1", [id, phone]);
+      }
+      return id;
+    }
 
     const ins = await client.query(
       `INSERT INTO customers (first_name, last_name, phone, email)
        VALUES ($1,$2,$3,$4) RETURNING id`,
-      [firstName, lastName, phoneNumber, email || null]
+      [firstName, lastName, phone, email || null]
     );
     return ins.rows[0].id;
   } finally {
@@ -352,7 +375,7 @@ async function scheduleSmsJobs(bookingId) {
   if (!rows[0]) return;
 
   const appointmentAt = rows[0].appointment_at; // JS Date (pg)
-  const phone = rows[0].phone;
+  const phone = normalizeBePhone(rows[0].phone);
   const firstName = rows[0].first_name || "";
   const serviceName = rows[0].service_name || "Rendez-vous";
 
@@ -368,20 +391,24 @@ async function scheduleSmsJobs(bookingId) {
     address: "Rue des Capucins 64, 7000 Mons",
   };
 
-  const tplJ1 = process.env.SMS_TEMPLATE_J1 || "4D FASHION – Rappel J-1 : {service} le {date} à {time}. Adresse : {address}.";
-  const tplH5 = process.env.SMS_TEMPLATE_H5 || "4D FASHION – Rappel H-5 : {service} le {date} à {time}. Adresse : {address}.";
+  const tplJ1 =
+    process.env.SMS_TEMPLATE_J1 ||
+    "4D FASHION – Rappel J-1 : {service} le {date} à {time}. Adresse : {address}.";
+  const tplH5 =
+    process.env.SMS_TEMPLATE_H5 ||
+    "4D FASHION – Rappel H-5 : {service} le {date} à {time}. Adresse : {address}.";
 
   const msgJ1 = applyTemplate(tplJ1, vars);
   const msgH5 = applyTemplate(tplH5, vars);
 
   await pool.query(
-    `INSERT INTO sms_jobs (booking_id, phone, message, send_at)
-     VALUES ($1,$2,$3,$4)`,
+    `INSERT INTO sms_jobs (booking_id, phone, message, send_at, status)
+     VALUES ($1,$2,$3,$4,'PENDING')`,
     [bookingId, phone, msgJ1, remind1]
   );
   await pool.query(
-    `INSERT INTO sms_jobs (booking_id, phone, message, send_at)
-     VALUES ($1,$2,$3,$4)`,
+    `INSERT INTO sms_jobs (booking_id, phone, message, send_at, status)
+     VALUES ($1,$2,$3,$4,'PENDING')`,
     [bookingId, phone, msgH5, remind2]
   );
 }
@@ -420,13 +447,21 @@ async function sendPendingSmsJobs() {
     try {
       await twilio.messages.create({
         from: TWILIO_FROM_NUMBER,
-        to: job.phone,
+        to: normalizeBePhone(job.phone),
         body: job.message,
       });
-      await pool.query("UPDATE sms_jobs SET sent_at=now(), status='SENT' WHERE id=$1", [job.id]);
+
+      await pool.query("UPDATE sms_jobs SET sent_at=now(), status='SENT', error=NULL WHERE id=$1", [
+        job.id,
+      ]);
     } catch (e) {
-      console.error("Twilio send failed:", e?.message || e);
-      await pool.query("UPDATE sms_jobs SET status='FAILED' WHERE id=$1", [job.id]);
+      const errMsg = e?.message || String(e);
+      console.error("Twilio send failed:", errMsg);
+
+      await pool.query("UPDATE sms_jobs SET status='FAILED', error=$2 WHERE id=$1", [
+        job.id,
+        errMsg,
+      ]);
     }
   }
 }
@@ -452,7 +487,7 @@ app.get("/health", async (req, res) => {
   });
 });
 
-// Services list (only active if you use is_active)
+// Services list (only active)
 app.get("/api/services", async (req, res) => {
   const { rows } = await pool.query(`
     SELECT 
@@ -483,7 +518,6 @@ app.post("/api/bookings", async (req, res) => {
 
     const customerId = await getOrCreateCustomer(body.customer);
 
-    // appointmentDateTime in ISO. Store UTC ISO string.
     const appointmentAtUtcIso = DateTime.fromISO(String(body.appointmentDateTime), {
       zone: "Europe/Brussels",
     })
@@ -563,7 +597,6 @@ app.get("/payments/paypal/return", async (req, res) => {
         BookingStatus.CONFIRMED,
       ]);
 
-      // schedule sms jobs once
       const check = await pool.query("SELECT 1 FROM sms_jobs WHERE booking_id=$1 LIMIT 1", [bookingId]);
       if (check.rowCount === 0) await scheduleSmsJobs(bookingId);
 
@@ -590,11 +623,11 @@ app.get("/payments/paypal/cancel", async (req, res) => {
 });
 
 /** =========================================================
- *  12) Success / Cancel HTML pages (futuriste) + deep link button
+ *  12) Success / Cancel HTML pages (deep link only)
  *  ========================================================= */
 app.get("/success", async (req, res) => {
   const bookingId = (req.query.bookingId || "").toString().trim();
-  if (!bookingId) return res.status(200).send(renderSuccessHtml({ bookingId: null }));
+  if (!bookingId) return res.status(200).send("<h2>Paiement confirmé ✅</h2>");
 
   try {
     const { rows } = await pool.query(
@@ -625,7 +658,7 @@ app.get("/success", async (req, res) => {
 
 app.get("/cancel", async (req, res) => {
   const bookingId = (req.query.bookingId || "").toString().trim();
-  if (!bookingId) return res.status(200).send(renderCancelHtml({ bookingId: null }));
+  if (!bookingId) return res.status(200).send("<h2>Paiement annulé ❌</h2>");
 
   try {
     const { rows } = await pool.query(
@@ -665,17 +698,13 @@ function renderSuccessHtml({ bookingId, booking, error }) {
   const total = b.totalPriceEur != null ? moneyEUR(b.totalPriceEur) : "-";
   const deposit = b.depositRequiredEur != null ? moneyEUR(b.depositRequiredEur) : "-";
   const paid = b.depositPaid === true ? "Oui ✅" : "En attente ⏳";
-  const status = b.status ? escapeHtml(b.status) : "-";
   const method = b.paymentMethod ? escapeHtml(b.paymentMethod) : "-";
-  const phone = b.phone ? escapeHtml(b.phone) : "-";
   const safeId = bookingId ? escapeHtml(bookingId) : "-";
 
   const deepLink = bookingId ? `${APP_DEEP_LINK_SCHEME}${encodeURIComponent(bookingId)}` : "4dfashion://booking";
 
-  return `<!doctype html>
-<html lang="fr"><head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
+  return `<!doctype html><html lang="fr"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>${salonName} — Paiement confirmé</title>
 <style>
 :root{--bg:#070A12;--card:#0D1224;--cyan:#00FFF0;--purple:#8B5CF6;--pink:#FF4ECD;--text:#EAFBFF;--muted:#9AA4BF;--ok:#27F7A3;}
@@ -685,68 +714,32 @@ background:radial-gradient(900px 600px at 20% 15%, rgba(0,255,240,.18), transpar
 radial-gradient(900px 600px at 75% 25%, rgba(139,92,246,.18), transparent 60%),
 radial-gradient(900px 600px at 55% 90%, rgba(255,78,205,.14), transparent 60%), var(--bg);}
 .wrap{max-width:980px;margin:0 auto;padding:28px 16px 40px;}
-.top{display:flex;gap:16px;align-items:flex-start;justify-content:space-between;margin-bottom:18px;}
 .brand h1{margin:0;font-size:18px;letter-spacing:.4px;color:var(--cyan);text-transform:uppercase;}
 .brand p{margin:6px 0 0;color:var(--muted);font-size:14px;}
-.badge{padding:10px 14px;border-radius:999px;background:linear-gradient(90deg, rgba(0,255,240,.18), rgba(139,92,246,.12), rgba(255,78,205,.10));
-border:1px solid rgba(0,255,240,.35);font-weight:800;font-size:13px;box-shadow:0 0 28px rgba(0,255,240,.15);white-space:nowrap;}
-.hero{background:linear-gradient(180deg, rgba(13,18,36,.92), rgba(11,16,32,.92));
-border:1px solid rgba(0,255,240,.22);border-radius:18px;padding:18px;box-shadow:0 0 38px rgba(0,255,240,.10);margin-bottom:14px;}
-.hero h2{margin:0;font-size:22px;}
-.hero .sub{margin:8px 0 0;color:var(--muted);}
-.grid{display:grid;grid-template-columns:1fr;gap:12px;}
-@media (min-width:860px){.grid{grid-template-columns:1.2fr .8fr;}}
-.card{background:rgba(13,18,36,.96);border:1px solid rgba(139,92,246,.18);border-radius:18px;padding:16px;}
-.card h3{margin:0 0 10px;font-size:16px;color:var(--purple);}
+.hero{margin-top:14px;background:rgba(13,18,36,.96);border:1px solid rgba(0,255,240,.22);border-radius:18px;padding:16px;}
 .row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06);}
 .row:last-child{border-bottom:0}
 .k{color:var(--muted)} .v{font-weight:650}
-.ok{color:var(--ok);font-weight:800}
-.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;}
-.btn{appearance:none;border:0;cursor:pointer;padding:12px 14px;border-radius:14px;
+.btn{margin-top:14px;display:inline-block;padding:12px 14px;border-radius:14px;
 background:linear-gradient(90deg,var(--cyan),var(--purple),var(--pink));
-color:var(--bg);font-weight:800;text-decoration:none;display:inline-block;box-shadow:0 0 26px rgba(0,255,240,.18);}
-.btn.secondary{background:transparent;border:1px solid rgba(0,255,240,.35);color:var(--text);box-shadow:none;}
-.note{margin-top:12px;color:var(--muted);font-size:13px;}
+color:var(--bg);font-weight:800;text-decoration:none;}
 .err{margin-top:10px;color:#ffb0c0;font-size:13px;}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="top">
-    <div class="brand"><h1>${salonName}</h1><p>${address}</p></div>
-    <div class="badge">Paiement confirmé ✅</div>
-  </div>
-
+</style></head>
+<body><div class="wrap">
+  <div class="brand"><h1>${salonName}</h1><p>${address}</p></div>
   <div class="hero">
-    <h2>Votre rendez-vous est enregistré.</h2>
-    <p class="sub">Merci <b>${escapeHtml(fullName || "cliente")}</b> — votre acompte est enregistré.</p>
+    <h2 style="margin:0;">Paiement confirmé ✅</h2>
+    <p style="color:var(--muted);margin:8px 0 0;">Merci <b>${escapeHtml(fullName || "cliente")}</b> — rendez-vous enregistré.</p>
     ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
-  </div>
+    <div class="row"><div class="k">Réservation</div><div class="v">${safeId}</div></div>
+    <div class="row"><div class="k">Prestation</div><div class="v">${serviceName}</div></div>
+    <div class="row"><div class="k">Date & heure</div><div class="v">${escapeHtml(appointment)}</div></div>
+    <div class="row"><div class="k">Acompte payé</div><div class="v" style="color:${b.depositPaid ? "var(--ok)" : "var(--text)"}">${paid}</div></div>
+    <div class="row"><div class="k">Total</div><div class="v">${escapeHtml(total)}</div></div>
+    <div class="row"><div class="k">Acompte</div><div class="v">${escapeHtml(deposit)}</div></div>
+    <div class="row"><div class="k">Paiement</div><div class="v">${method}</div></div>
 
-  <div class="grid">
-    <div class="card">
-      <h3>Récapitulatif</h3>
-      <div class="row"><div class="k">Prestation</div><div class="v">${serviceName}</div></div>
-      <div class="row"><div class="k">Date & heure</div><div class="v">${escapeHtml(appointment)}</div></div>
-      <div class="row"><div class="k">Acompte payé</div><div class="v ${b.depositPaid===true ? "ok":""}">${paid}</div></div>
-      <div class="row"><div class="k">Montant total</div><div class="v">${escapeHtml(total)}</div></div>
-      <div class="row"><div class="k">Acompte (20%)</div><div class="v">${escapeHtml(deposit)}</div></div>
-      <div class="row"><div class="k">Paiement</div><div class="v">${method}</div></div>
-    </div>
-
-    <div class="card">
-      <h3>Détails</h3>
-      <div class="row"><div class="k">Réservation</div><div class="v">${safeId}</div></div>
-      <div class="row"><div class="k">Statut</div><div class="v">${status}</div></div>
-      <div class="row"><div class="k">Téléphone</div><div class="v">${phone}</div></div>
-
-<div class="btns">
-  <a class="btn" href="${deepLink}" onclick="openApp(event)">Retour à l’application</a>
-</div>
-
-      <div class="note">Vous recevrez un SMS de rappel 24h et 5h avant votre rendez-vous.</div>
-    </div>
+    <a class="btn" href="${deepLink}" onclick="openApp(event)">Retour à l’application</a>
   </div>
 </div>
 
@@ -755,10 +748,7 @@ function openApp(e){
   e.preventDefault();
   const deep = ${JSON.stringify(deepLink)};
   window.location.href = deep;
-  // fallback Play Store si app non installée (Android)
-  setTimeout(function(){
-    window.location.href = ${JSON.stringify(PLAY_STORE_URL)};
-  }, 1400);
+  setTimeout(function(){ window.location.href = ${JSON.stringify(PLAY_STORE_URL)}; }, 1400);
 }
 </script>
 </body></html>`;
@@ -774,10 +764,8 @@ function renderCancelHtml({ bookingId, booking, error }) {
   const safeId = bookingId ? escapeHtml(bookingId) : "-";
   const deepLink = bookingId ? `${APP_DEEP_LINK_SCHEME}${encodeURIComponent(bookingId)}` : "4dfashion://booking";
 
-  return `<!doctype html>
-<html lang="fr"><head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
+  return `<!doctype html><html lang="fr"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>${salonName} — Paiement annulé</title>
 <style>
 :root{--bg:#070A12;--card:#0D1224;--cyan:#00FFF0;--purple:#8B5CF6;--pink:#FF4ECD;--text:#EAFBFF;--muted:#9AA4BF;}
@@ -787,44 +775,37 @@ background:radial-gradient(900px 600px at 20% 15%, rgba(0,255,240,.14), transpar
 radial-gradient(900px 600px at 75% 25%, rgba(139,92,246,.14), transparent 60%),
 radial-gradient(900px 600px at 55% 90%, rgba(255,78,205,.10), transparent 60%), var(--bg);}
 .wrap{max-width:980px;margin:0 auto;padding:28px 16px 40px;}
-.card{background:rgba(13,18,36,.96);border:1px solid rgba(255,78,205,.18);border-radius:18px;padding:16px;}
 .brand h1{margin:0;font-size:18px;color:var(--cyan);text-transform:uppercase;}
 .brand p{margin:6px 0 0;color:var(--muted);font-size:14px;}
-.badge{margin-top:14px;display:inline-block;padding:10px 14px;border-radius:999px;border:1px solid rgba(255,78,205,.35);
-background:linear-gradient(90deg, rgba(255,78,205,.16), rgba(139,92,246,.12));font-weight:800;}
+.hero{margin-top:14px;background:rgba(13,18,36,.96);border:1px solid rgba(255,78,205,.22);border-radius:18px;padding:16px;}
 .row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06);}
 .row:last-child{border-bottom:0}
 .k{color:var(--muted)} .v{font-weight:650}
-.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;}
-.btn{appearance:none;border:0;cursor:pointer;padding:12px 14px;border-radius:14px;background:linear-gradient(90deg,var(--cyan),var(--purple),var(--pink));
-color:var(--bg);font-weight:800;text-decoration:none;display:inline-block;}
-.btn.secondary{background:transparent;border:1px solid rgba(0,255,240,.35);color:var(--text);}
+.btn{margin-top:14px;display:inline-block;padding:12px 14px;border-radius:14px;
+background:linear-gradient(90deg,var(--cyan),var(--purple),var(--pink));
+color:var(--bg);font-weight:800;text-decoration:none;}
 .err{margin-top:10px;color:#ffb0c0;font-size:13px;}
 </style></head>
-<body><div class="wrap"><div class="card">
+<body><div class="wrap">
   <div class="brand"><h1>${salonName}</h1><p>${address}</p></div>
-  <div class="badge">Paiement annulé ❌</div>
-  <p style="color:var(--muted);margin-top:10px;">Votre rendez-vous n’est pas confirmé.</p>
-  ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
+  <div class="hero">
+    <h2 style="margin:0;">Paiement annulé ❌</h2>
+    <p style="color:var(--muted);margin:8px 0 0;">Votre rendez-vous n’est pas confirmé.</p>
+    ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
+    <div class="row"><div class="k">Réservation</div><div class="v">${safeId}</div></div>
+    <div class="row"><div class="k">Prestation</div><div class="v">${serviceName}</div></div>
+    <div class="row"><div class="k">Date & heure</div><div class="v">${escapeHtml(appointment)}</div></div>
 
-  <div class="row"><div class="k">Réservation</div><div class="v">${safeId}</div></div>
-  <div class="row"><div class="k">Prestation</div><div class="v">${serviceName}</div></div>
-  <div class="row"><div class="k">Date & heure</div><div class="v">${escapeHtml(appointment)}</div></div>
-
-<div class="btns">
-  <a class="btn" href="${deepLink}" onclick="openApp(event)">Retour à l’application</a>
+    <a class="btn" href="${deepLink}" onclick="openApp(event)">Retour à l’application</a>
+  </div>
 </div>
-
-</div></div>
 
 <script>
 function openApp(e){
   e.preventDefault();
   const deep = ${JSON.stringify(deepLink)};
   window.location.href = deep;
-  setTimeout(function(){
-    window.location.href = ${JSON.stringify(PLAY_STORE_URL)};
-  }, 1400);
+  setTimeout(function(){ window.location.href = ${JSON.stringify(PLAY_STORE_URL)}; }, 1400);
 }
 </script>
 </body></html>`;
@@ -839,34 +820,13 @@ function requireAdmin(req, res, next) {
   next();
 }
 app.get("/api/admin/bookings", requireAdmin, async (req, res) => {
-  const q = (req.query.q || "").toString().trim();
-  const status = (req.query.status || "").toString().trim();
-
-  const params = [];
-  let where = "WHERE 1=1";
-  if (q) {
-    params.push(`%${q}%`);
-    where += ` AND (c.first_name ILIKE $${params.length} OR c.last_name ILIKE $${params.length} OR c.phone ILIKE $${params.length} OR b.id ILIKE $${params.length} OR b.service_name ILIKE $${params.length})`;
-  }
-  if (status) {
-    params.push(status);
-    where += ` AND b.status = $${params.length}`;
-  }
-
   const { rows } = await pool.query(
-    `SELECT 
-        b.id, b.status, b.payment_method AS "paymentMethod", b.deposit_paid AS "depositPaid",
-        b.service_name AS "serviceName",
-        b.total_price_eur::float8 AS "totalPriceEur",
-        b.deposit_required_eur::float8 AS "depositRequiredEur",
-        b.appointment_at AS "appointmentAt",
-        c.first_name AS "firstName", c.last_name AS "lastName", c.phone
+    `SELECT b.id, b.status, b.deposit_paid AS "depositPaid",
+            b.service_name AS "serviceName",
+            b.appointment_at AS "appointmentAt"
      FROM bookings b
-     JOIN customers c ON c.id=b.customer_id
-     ${where}
      ORDER BY b.appointment_at DESC
-     LIMIT 200`,
-    params
+     LIMIT 200`
   );
   res.json(rows);
 });
@@ -875,7 +835,8 @@ app.get("/api/admin/bookings", requireAdmin, async (req, res) => {
  *  14) Startup
  *  ========================================================= */
 (async () => {
-  await upsertServices(); // remove if you prefer manual SQL only
+  await ensureDbColumns();
+  await upsertServices();
   app.listen(PORT, () => console.log(`4D Fashion Booking API running on port ${PORT}`));
 })();
 
