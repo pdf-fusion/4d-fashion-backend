@@ -52,18 +52,18 @@ const PAYPAL_API_BASE = (process.env.PAYPAL_API_BASE || "https://api-m.sandbox.p
   ""
 );
 
-// Admin API token (optional)
+// Admin API token
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 
 // Deep link scheme
 const APP_DEEP_LINK_SCHEME = "4dfashion://booking?bookingId=";
 
-// Play Store fallback (optional)
+// Play Store fallback
 const PLAY_STORE_URL =
   process.env.PLAY_STORE_URL ||
   "https://play.google.com/store/apps/details?id=com.debeng.a4dfashionservices";
 
-// ✅ Numéro du salon (alerte instantanée)
+// ✅ Numéro du salon (notification instantanée)
 const SALON_NOTIFY_PHONE = process.env.SALON_NOTIFY_PHONE || "+32465136027";
 
 const BookingStatus = {
@@ -122,7 +122,7 @@ function assertValidUrl(u, name) {
   }
 }
 
-// ✅ Normalise BE phone to E.164 for Twilio (0486... -> +32486...)
+// ✅ Normalise BE phone to E.164
 function normalizeBePhone(phoneRaw) {
   const p = String(phoneRaw || "").trim().replace(/\s+/g, "");
   if (!p) return "";
@@ -156,13 +156,12 @@ function moneyEUR(v) {
   return n.toFixed(2) + " €";
 }
 
-// SMS templates
 function applyTemplate(tpl, vars) {
   return String(tpl || "").replace(/\{(\w+)\}/g, (_, k) => (vars[k] ?? ""));
 }
 
 /** =========================================================
- *  6) Services seed (optional – upsert on start)
+ *  6) Services seed
  *  ========================================================= */
 const SERVICE_SEED = [
   { id: "DREADLOCKS", name: "Dreadlocks", category: "Coiffure", priceEur: 120.0, durationMinutes: 180 },
@@ -182,7 +181,6 @@ const SERVICE_SEED = [
 async function ensureDbColumns() {
   await pool.query("ALTER TABLE services ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;");
   await pool.query("ALTER TABLE sms_jobs ADD COLUMN IF NOT EXISTS error TEXT;");
-  // ✅ pour éviter doublons (confirmations)
   await pool.query("ALTER TABLE sms_jobs ADD COLUMN IF NOT EXISTS kind TEXT;");
   await pool.query("CREATE INDEX IF NOT EXISTS idx_sms_jobs_kind ON sms_jobs(kind);");
 }
@@ -366,16 +364,13 @@ async function createBookingRow({ bookingId, salonId, customerId, service, appoi
 }
 
 /** =========================================================
- *  10) SMS: schedule reminders + instant confirmations
+ *  10) SMS logic
  *  ========================================================= */
-
-// Envoi Twilio immédiat (utilisé par confirmations)
 async function sendSmsNow(to, body) {
   if (!twilio || !TWILIO_FROM_NUMBER) return;
   const toNorm = normalizeBePhone(to);
   if (!toNorm) return;
 
-  // sécurité: évite To == From
   if (normalizeBePhone(TWILIO_FROM_NUMBER) === toNorm) {
     throw new Error("'To' and 'From' number cannot be the same");
   }
@@ -389,7 +384,7 @@ async function sendSmsNow(to, body) {
 
 async function scheduleSmsJobs(bookingId) {
   const { rows } = await pool.query(
-    `SELECT b.id, b.appointment_at, c.phone, c.first_name, c.last_name, b.service_name, b.deposit_required_eur
+    `SELECT b.id, b.appointment_at, c.phone, c.first_name, c.last_name, b.service_name
      FROM bookings b
      JOIN customers c ON c.id=b.customer_id
      WHERE b.id=$1`,
@@ -397,7 +392,7 @@ async function scheduleSmsJobs(bookingId) {
   );
   if (!rows[0]) return;
 
-  const appointmentAt = rows[0].appointment_at; // JS Date
+  const appointmentAt = rows[0].appointment_at;
   const phone = normalizeBePhone(rows[0].phone);
   const firstName = rows[0].first_name || "";
   const serviceName = rows[0].service_name || "Rendez-vous";
@@ -414,12 +409,8 @@ async function scheduleSmsJobs(bookingId) {
     address: "Rue des Capucins 64, 7000 Mons",
   };
 
-  const tplJ1 =
-    process.env.SMS_TEMPLATE_J1 ||
-    "4D FASHION – Rappel J-1 : {service} le {date} à {time}. Adresse : {address}.";
-  const tplH5 =
-    process.env.SMS_TEMPLATE_H5 ||
-    "4D FASHION – Rappel H-5 : {service} le {date} à {time}. Adresse : {address}.";
+  const tplJ1 = process.env.SMS_TEMPLATE_J1 || "4D FASHION – Rappel J-1 : {service} le {date} à {time}. Adresse : {address}.";
+  const tplH5 = process.env.SMS_TEMPLATE_H5 || "4D FASHION – Rappel H-5 : {service} le {date} à {time}. Adresse : {address}.";
 
   const msgJ1 = applyTemplate(tplJ1, vars);
   const msgH5 = applyTemplate(tplH5, vars);
@@ -437,7 +428,6 @@ async function scheduleSmsJobs(bookingId) {
 }
 
 async function sendInstantConfirmationSms(bookingId) {
-  // anti-doublon : si déjà envoyé, stop
   const already = await pool.query(
     "SELECT 1 FROM sms_jobs WHERE booking_id=$1 AND kind IN ('CONFIRM_CUSTOMER','CONFIRM_SALON') LIMIT 1",
     [bookingId]
@@ -481,25 +471,20 @@ async function sendInstantConfirmationSms(bookingId) {
   const msgCustomer = applyTemplate(tplCustomer, vars);
   const msgSalon = applyTemplate(tplSalon, vars);
 
-  // Envoi client
   let customerError = null;
   try {
     await sendSmsNow(vars.phone, msgCustomer);
   } catch (e) {
     customerError = e?.message || String(e);
-    console.error("Instant customer SMS failed:", customerError);
   }
 
-  // Envoi salon
   let salonError = null;
   try {
     await sendSmsNow(SALON_NOTIFY_PHONE, msgSalon);
   } catch (e) {
     salonError = e?.message || String(e);
-    console.error("Instant salon SMS failed:", salonError);
   }
 
-  // Log en DB (traçabilité)
   await pool.query(
     `INSERT INTO sms_jobs (booking_id, phone, message, send_at, status, sent_at, kind, error)
      VALUES ($1,$2,$3, now(), $4, CASE WHEN $4='SENT' THEN now() ELSE NULL END, 'CONFIRM_CUSTOMER', $5)`,
@@ -523,21 +508,17 @@ async function markBookingConfirmed(bookingId, { stripeSessionId } = {}) {
     [bookingId, BookingStatus.CONFIRMED, stripeSessionId || null]
   );
 
-  // Planifier rappels
   const check = await pool.query(
     "SELECT 1 FROM sms_jobs WHERE booking_id=$1 AND kind IN ('REMINDER_J1','REMINDER_H5') LIMIT 1",
     [bookingId]
   );
-  if (check.rowCount === 0) {
-    await scheduleSmsJobs(bookingId);
-  }
+  if (check.rowCount === 0) await scheduleSmsJobs(bookingId);
 
-  // ✅ Confirmation immédiate client + salon
   await sendInstantConfirmationSms(bookingId);
 }
 
 /** =========================================================
- *  11) SMS worker (cron every minute) for reminders
+ *  11) SMS worker (cron every minute) for PENDING
  *  ========================================================= */
 async function sendPendingSmsJobs() {
   if (!twilio || !TWILIO_FROM_NUMBER) return;
@@ -557,18 +538,10 @@ async function sendPendingSmsJobs() {
         to: normalizeBePhone(job.phone),
         body: job.message,
       });
-
-      await pool.query("UPDATE sms_jobs SET sent_at=now(), status='SENT', error=NULL WHERE id=$1", [
-        job.id,
-      ]);
+      await pool.query("UPDATE sms_jobs SET sent_at=now(), status='SENT', error=NULL WHERE id=$1", [job.id]);
     } catch (e) {
       const errMsg = e?.message || String(e);
-      console.error("Twilio send failed:", errMsg);
-
-      await pool.query("UPDATE sms_jobs SET status='FAILED', error=$2 WHERE id=$1", [
-        job.id,
-        errMsg,
-      ]);
+      await pool.query("UPDATE sms_jobs SET status='FAILED', error=$2 WHERE id=$1", [job.id, errMsg]);
     }
   }
 }
@@ -579,27 +552,21 @@ cron.schedule("* * * * *", () => {
 /** =========================================================
  *  12) Routes
  *  ========================================================= */
-app.get("/", (req, res) => res.send("4D Fashion Booking API en ligne 🚀"));
-
 app.get("/health", async (req, res) => {
-  const dbOk = await pool.query("SELECT 1 AS ok").then(() => true).catch(() => false);
+  const dbOk = await pool.query("SELECT 1").then(() => true).catch(() => false);
   res.json({
     status: "ok",
     apiBase: API_BASE || null,
     dbOk,
-    paypalConfigured: Boolean(PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET && PAYPAL_API_BASE),
-    stripeConfigured: Boolean(STRIPE_SECRET_KEY),
-    webhookConfigured: Boolean(process.env.STRIPE_WEBHOOK_SECRET),
     twilioConfigured: Boolean(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_FROM_NUMBER),
   });
 });
 
 app.get("/api/services", async (req, res) => {
   const { rows } = await pool.query(`
-    SELECT 
-      id, name, category,
-      price_eur::float8 AS "priceEur",
-      duration_minutes AS "durationMinutes"
+    SELECT id, name, category,
+           price_eur::float8 AS "priceEur",
+           duration_minutes AS "durationMinutes"
     FROM services
     WHERE COALESCE(is_active, TRUE) = TRUE
     ORDER BY name ASC
@@ -607,16 +574,12 @@ app.get("/api/services", async (req, res) => {
   res.json(rows);
 });
 
-// Create booking
 app.post("/api/bookings", async (req, res) => {
   try {
     const body = req.body;
-
-    if (!body.customer?.firstName || !body.customer?.phoneNumber) {
-      return res.status(400).json({ error: "Customer (prénom + téléphone) requis" });
-    }
+    if (!body.customer?.firstName || !body.customer?.phoneNumber) return res.status(400).json({ error: "customer requis" });
     if (!body.appointmentDateTime) return res.status(400).json({ error: "appointmentDateTime requis" });
-    if (!body.paymentMethod) return res.status(400).json({ error: "paymentMethod requis (PAYPAL ou BANCONTACT)" });
+    if (!body.paymentMethod) return res.status(400).json({ error: "paymentMethod requis" });
     if (!body.serviceId) return res.status(400).json({ error: "serviceId requis" });
 
     const service = await getService(body.serviceId);
@@ -624,12 +587,9 @@ app.post("/api/bookings", async (req, res) => {
 
     const customerId = await getOrCreateCustomer(body.customer);
 
-    const appointmentAtUtcIso = DateTime.fromISO(String(body.appointmentDateTime), {
-      zone: "Europe/Brussels",
-    })
+    const appointmentAtUtcIso = DateTime.fromISO(String(body.appointmentDateTime), { zone: "Europe/Brussels" })
       .toUTC()
       .toISO();
-
     if (!appointmentAtUtcIso) return res.status(400).json({ error: "appointmentDateTime invalide" });
 
     const bookingId = `BKG-${Date.now()}`;
@@ -654,34 +614,28 @@ app.post("/api/bookings", async (req, res) => {
       await pool.query("UPDATE bookings SET stripe_session_id=$2 WHERE id=$1", [bookingId, session.sessionId]);
       paymentUrl = session.url;
     } else {
-      return res.status(400).json({ error: "paymentMethod invalide. Utilise PAYPAL ou BANCONTACT." });
+      return res.status(400).json({ error: "paymentMethod invalide" });
     }
 
-    return res.status(201).json({
+    res.status(201).json({
       bookingId,
       status: BookingStatus.PENDING_DEPOSIT,
       paymentUrl,
       totalPriceEur: Number(totalPriceEur),
       depositRequiredEur: Number(depositRequiredEur),
-      message: "Booking créé, acompte en attente de paiement",
     });
   } catch (e) {
-    console.error("create booking error:", e);
-    res.status(500).json({ error: "Erreur serveur", details: e.message });
+    res.status(500).json({ error: "server error", details: e.message });
   }
 });
 
-// Get booking
 app.get("/api/bookings/:id", async (req, res) => {
   const { rows } = await pool.query(
-    `SELECT 
-        b.id,
-        b.status,
-        b.deposit_paid AS "depositPaid",
-        b.total_price_eur::float8 AS "totalPriceEur",
-        b.deposit_required_eur::float8 AS "depositRequiredEur",
-        b.payment_method AS "paymentMethod",
-        b.appointment_at AS "appointmentAt"
+    `SELECT b.id, b.status, b.deposit_paid AS "depositPaid",
+            b.total_price_eur::float8 AS "totalPriceEur",
+            b.deposit_required_eur::float8 AS "depositRequiredEur",
+            b.payment_method AS "paymentMethod",
+            b.appointment_at AS "appointmentAt"
      FROM bookings b WHERE b.id=$1`,
     [req.params.id]
   );
@@ -703,14 +657,12 @@ app.get("/payments/paypal/return", async (req, res) => {
         BookingStatus.CONFIRMED,
       ]);
 
-      // Planifier rappels si pas déjà là
       const check = await pool.query(
         "SELECT 1 FROM sms_jobs WHERE booking_id=$1 AND kind IN ('REMINDER_J1','REMINDER_H5') LIMIT 1",
         [bookingId]
       );
       if (check.rowCount === 0) await scheduleSmsJobs(bookingId);
 
-      // ✅ SMS instantané client + salon
       await sendInstantConfirmationSms(bookingId);
 
       const redirectUrl = `${FRONTEND_SUCCESS_URL || API_BASE + "/success"}?bookingId=${encodeURIComponent(bookingId)}`;
@@ -721,7 +673,6 @@ app.get("/payments/paypal/return", async (req, res) => {
     const redirectUrl = `${FRONTEND_CANCEL_URL || API_BASE + "/cancel"}?bookingId=${encodeURIComponent(bookingId)}`;
     return res.redirect(302, redirectUrl);
   } catch (e) {
-    console.error("paypal return error:", e);
     res.status(500).send("Erreur PayPal");
   }
 });
@@ -735,155 +686,132 @@ app.get("/payments/paypal/cancel", async (req, res) => {
   return res.redirect(302, redirectUrl);
 });
 
-/** =========================================================
- *  13) Success / Cancel HTML pages (deep link only)
- *  ========================================================= */
-app.get("/success", async (req, res) => {
+// Success/Cancel pages (simple, deep link)
+app.get("/success", (req, res) => {
   const bookingId = (req.query.bookingId || "").toString().trim();
-  if (!bookingId) return res.status(200).send("<h2>Paiement confirmé ✅</h2>");
+  const deepLink = bookingId ? `${APP_DEEP_LINK_SCHEME}${encodeURIComponent(bookingId)}` : "4dfashion://booking";
+  res.status(200).send(`
+    <html><body style="font-family:Arial;background:#070A12;color:#EAFBFF;padding:24px">
+      <h2>Paiement confirmé ✅</h2>
+      <p>Votre réservation est enregistrée.</p>
+      <a href="${deepLink}">Retour à l’application</a>
+      <script>
+        setTimeout(function(){ window.location.href=${JSON.stringify(PLAY_STORE_URL)}; }, 1400);
+      </script>
+    </body></html>
+  `);
+});
 
+app.get("/cancel", (req, res) => {
+  const bookingId = (req.query.bookingId || "").toString().trim();
+  const deepLink = bookingId ? `${APP_DEEP_LINK_SCHEME}${encodeURIComponent(bookingId)}` : "4dfashion://booking";
+  res.status(200).send(`
+    <html><body style="font-family:Arial;background:#070A12;color:#EAFBFF;padding:24px">
+      <h2>Paiement annulé ❌</h2>
+      <p>Votre réservation n’est pas confirmée.</p>
+      <a href="${deepLink}">Retour à l’application</a>
+      <script>
+        setTimeout(function(){ window.location.href=${JSON.stringify(PLAY_STORE_URL)}; }, 1400);
+      </script>
+    </body></html>
+  `);
+});
+
+/** =========================================================
+ *  13) ADMIN routes (TEST WITHOUT PAYMENT)
+ *  ========================================================= */
+function requireAdmin(req, res, next) {
+  const token = req.headers["x-admin-token"];
+  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(401).json({ error: "Unauthorized" });
+  next();
+}
+
+// Create TEST booking + confirm + send SMS
+app.post("/api/admin/test-booking", requireAdmin, async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT 
-          b.id,
-          b.deposit_paid AS "depositPaid",
-          b.payment_method AS "paymentMethod",
-          b.service_name AS "serviceName",
-          b.total_price_eur::float8 AS "totalPriceEur",
-          b.deposit_required_eur::float8 AS "depositRequiredEur",
-          b.appointment_at AS "appointmentAt",
-          c.first_name AS "firstName",
-          c.last_name AS "lastName",
-          c.phone AS "phone"
-       FROM bookings b
-       JOIN customers c ON c.id = b.customer_id
-       WHERE b.id = $1
-       LIMIT 1`,
-      [bookingId]
+    const body = req.body || {};
+    const phone = normalizeBePhone(body.phone || "");
+    const firstName = body.firstName || "Test";
+    const lastName = body.lastName || "Client";
+    const serviceId = body.serviceId || "BRAIDS_RETOUCH_MEN";
+    const appointmentDateTime = body.appointmentDateTime || DateTime.now().plus({ days: 2 }).toISO();
+
+    if (!phone) return res.status(400).json({ error: "phone requis (format +32...)" });
+
+    const service = await getService(serviceId);
+    if (!service) return res.status(400).json({ error: "serviceId invalide" });
+
+    const customerId = await getOrCreateCustomer({
+      firstName,
+      lastName,
+      phoneNumber: phone,
+      email: body.email || null
+    });
+
+    const appointmentAtUtcIso = DateTime.fromISO(String(appointmentDateTime), { zone: "Europe/Brussels" })
+      .toUTC()
+      .toISO();
+    if (!appointmentAtUtcIso) return res.status(400).json({ error: "appointmentDateTime invalide" });
+
+    const bookingId = `BKG-TEST-${Date.now()}`;
+    const { totalPriceEur, depositRequiredEur } = await createBookingRow({
+      bookingId,
+      salonId: "4D-FASHION-SERVICES-SRL",
+      customerId,
+      service,
+      appointmentAtUtcIso,
+      paymentMethod: "TEST",
+      notes: "TEST BOOKING (no payment)"
+    });
+
+    await pool.query(
+      "UPDATE bookings SET status=$2, deposit_paid=true, updated_at=now() WHERE id=$1",
+      [bookingId, "CONFIRMED"]
     );
-    return res.status(200).send(renderSuccessHtml({ bookingId, booking: rows[0] || null }));
+
+    await scheduleSmsJobs(bookingId);
+    await sendInstantConfirmationSms(bookingId);
+
+    return res.json({
+      ok: true,
+      bookingId,
+      status: "CONFIRMED",
+      totalPriceEur: Number(totalPriceEur),
+      depositRequiredEur: Number(depositRequiredEur)
+    });
   } catch (e) {
-    console.error("success page error:", e);
-    return res.status(200).send(renderSuccessHtml({ bookingId, booking: null, error: "Impossible de charger la réservation." }));
+    console.error("admin test-booking error:", e);
+    return res.status(500).json({ error: "Server error", details: e.message });
   }
 });
 
-app.get("/cancel", async (req, res) => {
-  const bookingId = (req.query.bookingId || "").toString().trim();
-  if (!bookingId) return res.status(200).send("<h2>Paiement annulé ❌</h2>");
+// Confirm existing booking + send SMS
+app.post("/api/admin/confirm-booking/:id", requireAdmin, async (req, res) => {
+  try {
+    const bookingId = req.params.id;
 
-  return res.status(200).send(renderCancelHtml({ bookingId }));
+    const exists = await pool.query("SELECT id FROM bookings WHERE id=$1 LIMIT 1", [bookingId]);
+    if (exists.rowCount === 0) return res.status(404).json({ error: "Booking introuvable" });
+
+    await pool.query(
+      "UPDATE bookings SET status=$2, deposit_paid=true, updated_at=now() WHERE id=$1",
+      [bookingId, "CONFIRMED"]
+    );
+
+    const check = await pool.query(
+      "SELECT 1 FROM sms_jobs WHERE booking_id=$1 AND kind IN ('REMINDER_J1','REMINDER_H5') LIMIT 1",
+      [bookingId]
+    );
+    if (check.rowCount === 0) await scheduleSmsJobs(bookingId);
+
+    await sendInstantConfirmationSms(bookingId);
+
+    return res.json({ ok: true, bookingId, status: "CONFIRMED" });
+  } catch (e) {
+    console.error("admin confirm-booking error:", e);
+    return res.status(500).json({ error: "Server error", details: e.message });
+  }
 });
-
-function renderSuccessHtml({ bookingId, booking, error }) {
-  const salonName = "4D FASHION SERVICES SRL";
-  const address = "Rue des Capucins 64, 7000 Mons, Belgique";
-
-  const b = booking || {};
-  const fullName = b.firstName ? `${b.firstName} ${b.lastName || ""}`.trim() : "";
-  const appointment = b.appointmentAt ? formatBrusselsFromDate(b.appointmentAt) : "-";
-  const serviceName = b.serviceName ? escapeHtml(b.serviceName) : "-";
-  const total = b.totalPriceEur != null ? moneyEUR(b.totalPriceEur) : "-";
-  const deposit = b.depositRequiredEur != null ? moneyEUR(b.depositRequiredEur) : "-";
-  const paid = b.depositPaid === true ? "Oui ✅" : "En attente ⏳";
-  const method = b.paymentMethod ? escapeHtml(b.paymentMethod) : "-";
-  const safeId = bookingId ? escapeHtml(bookingId) : "-";
-
-  const deepLink = bookingId ? `${APP_DEEP_LINK_SCHEME}${encodeURIComponent(bookingId)}` : "4dfashion://booking";
-
-  return `<!doctype html><html lang="fr"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>${salonName} — Paiement confirmé</title>
-<style>
-:root{--bg:#070A12;--card:#0D1224;--cyan:#00FFF0;--purple:#8B5CF6;--pink:#FF4ECD;--text:#EAFBFF;--muted:#9AA4BF;--ok:#27F7A3;}
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;
-background:radial-gradient(900px 600px at 20% 15%, rgba(0,255,240,.18), transparent 60%),
-radial-gradient(900px 600px at 75% 25%, rgba(139,92,246,.18), transparent 60%),
-radial-gradient(900px 600px at 55% 90%, rgba(255,78,205,.14), transparent 60%), var(--bg);}
-.wrap{max-width:980px;margin:0 auto;padding:28px 16px 40px;}
-.brand h1{margin:0;font-size:18px;letter-spacing:.4px;color:var(--cyan);text-transform:uppercase;}
-.brand p{margin:6px 0 0;color:var(--muted);font-size:14px;}
-.hero{margin-top:14px;background:rgba(13,18,36,.96);border:1px solid rgba(0,255,240,.22);border-radius:18px;padding:16px;}
-.row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06);}
-.row:last-child{border-bottom:0}
-.k{color:var(--muted)} .v{font-weight:650}
-.btn{margin-top:14px;display:inline-block;padding:12px 14px;border-radius:14px;
-background:linear-gradient(90deg,var(--cyan),var(--purple),var(--pink));
-color:var(--bg);font-weight:800;text-decoration:none;}
-.err{margin-top:10px;color:#ffb0c0;font-size:13px;}
-</style></head>
-<body><div class="wrap">
-  <div class="brand"><h1>${salonName}</h1><p>${address}</p></div>
-  <div class="hero">
-    <h2 style="margin:0;">Paiement confirmé ✅</h2>
-    <p style="color:var(--muted);margin:8px 0 0;">Merci <b>${escapeHtml(fullName || "cliente")}</b> — rendez-vous enregistré.</p>
-    ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
-    <div class="row"><div class="k">Réservation</div><div class="v">${safeId}</div></div>
-    <div class="row"><div class="k">Prestation</div><div class="v">${serviceName}</div></div>
-    <div class="row"><div class="k">Date & heure</div><div class="v">${escapeHtml(appointment)}</div></div>
-    <div class="row"><div class="k">Acompte payé</div><div class="v" style="color:${b.depositPaid ? "var(--ok)" : "var(--text)"}">${paid}</div></div>
-    <div class="row"><div class="k">Total</div><div class="v">${escapeHtml(total)}</div></div>
-    <div class="row"><div class="k">Acompte</div><div class="v">${escapeHtml(deposit)}</div></div>
-    <div class="row"><div class="k">Paiement</div><div class="v">${method}</div></div>
-
-    <a class="btn" href="${deepLink}" onclick="openApp(event)">Retour à l’application</a>
-  </div>
-</div>
-
-<script>
-function openApp(e){
-  e.preventDefault();
-  const deep = ${JSON.stringify(deepLink)};
-  window.location.href = deep;
-  setTimeout(function(){ window.location.href = ${JSON.stringify(PLAY_STORE_URL)}; }, 1400);
-}
-</script>
-</body></html>`;
-}
-
-function renderCancelHtml({ bookingId }) {
-  const salonName = "4D FASHION SERVICES SRL";
-  const address = "Rue des Capucins 64, 7000 Mons, Belgique";
-  const deepLink = bookingId ? `${APP_DEEP_LINK_SCHEME}${encodeURIComponent(bookingId)}` : "4dfashion://booking";
-
-  return `<!doctype html><html lang="fr"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>${salonName} — Paiement annulé</title>
-<style>
-:root{--bg:#070A12;--cyan:#00FFF0;--purple:#8B5CF6;--pink:#FF4ECD;--text:#EAFBFF;--muted:#9AA4BF;}
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;
-background:radial-gradient(900px 600px at 20% 15%, rgba(0,255,240,.14), transparent 60%),
-radial-gradient(900px 600px at 75% 25%, rgba(139,92,246,.14), transparent 60%),
-radial-gradient(900px 600px at 55% 90%, rgba(255,78,205,.10), transparent 60%), var(--bg);}
-.wrap{max-width:980px;margin:0 auto;padding:28px 16px 40px;}
-.brand h1{margin:0;font-size:18px;color:var(--cyan);text-transform:uppercase;}
-.brand p{margin:6px 0 0;color:var(--muted);font-size:14px;}
-.hero{margin-top:14px;background:rgba(13,18,36,.96);border:1px solid rgba(255,78,205,.22);border-radius:18px;padding:16px;}
-.btn{margin-top:14px;display:inline-block;padding:12px 14px;border-radius:14px;
-background:linear-gradient(90deg,var(--cyan),var(--purple),var(--pink));
-color:var(--bg);font-weight:800;text-decoration:none;}
-</style></head>
-<body><div class="wrap">
-  <div class="brand"><h1>${salonName}</h1><p>${address}</p></div>
-  <div class="hero">
-    <h2 style="margin:0;">Paiement annulé ❌</h2>
-    <p style="color:var(--muted);margin:8px 0 0;">Votre rendez-vous n’est pas confirmé.</p>
-    <a class="btn" href="${deepLink}" onclick="openApp(event)">Retour à l’application</a>
-  </div>
-</div>
-
-<script>
-function openApp(e){
-  e.preventDefault();
-  const deep = ${JSON.stringify(deepLink)};
-  window.location.href = deep;
-  setTimeout(function(){ window.location.href = ${JSON.stringify(PLAY_STORE_URL)}; }, 1400);
-}
-</script>
-</body></html>`;
-}
 
 /** =========================================================
  *  14) Startup
