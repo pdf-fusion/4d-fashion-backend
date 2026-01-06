@@ -63,6 +63,9 @@ const PLAY_STORE_URL =
   process.env.PLAY_STORE_URL ||
   "https://play.google.com/store/apps/details?id=com.debeng.a4dfashionservices";
 
+// ✅ Numéro du salon (alerte instantanée)
+const SALON_NOTIFY_PHONE = process.env.SALON_NOTIFY_PHONE || "+32465136027";
+
 const BookingStatus = {
   PENDING_DEPOSIT: "PENDING_DEPOSIT",
   CONFIRMED: "CONFIRMED",
@@ -123,9 +126,9 @@ function assertValidUrl(u, name) {
 function normalizeBePhone(phoneRaw) {
   const p = String(phoneRaw || "").trim().replace(/\s+/g, "");
   if (!p) return "";
-  if (p.startsWith("+")) return p; // already E.164
-  if (p.startsWith("00")) return "+" + p.slice(2); // 00xx -> +xx
-  if (p.startsWith("0")) return "+32" + p.slice(1); // 0xxxx -> +32xxxx
+  if (p.startsWith("+")) return p;
+  if (p.startsWith("00")) return "+" + p.slice(2);
+  if (p.startsWith("0")) return "+32" + p.slice(1);
   return p;
 }
 
@@ -153,6 +156,11 @@ function moneyEUR(v) {
   return n.toFixed(2) + " €";
 }
 
+// SMS templates
+function applyTemplate(tpl, vars) {
+  return String(tpl || "").replace(/\{(\w+)\}/g, (_, k) => (vars[k] ?? ""));
+}
+
 /** =========================================================
  *  6) Services seed (optional – upsert on start)
  *  ========================================================= */
@@ -172,17 +180,17 @@ const SERVICE_SEED = [
 ];
 
 async function ensureDbColumns() {
-  // services.is_active
   await pool.query("ALTER TABLE services ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;");
-  // sms_jobs.error
   await pool.query("ALTER TABLE sms_jobs ADD COLUMN IF NOT EXISTS error TEXT;");
+  // ✅ pour éviter doublons (confirmations)
+  await pool.query("ALTER TABLE sms_jobs ADD COLUMN IF NOT EXISTS kind TEXT;");
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_sms_jobs_kind ON sms_jobs(kind);");
 }
 
 async function upsertServices() {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-
     for (const s of SERVICE_SEED) {
       await client.query(
         `INSERT INTO services (id, name, category, price_eur, duration_minutes, is_active)
@@ -296,16 +304,14 @@ async function getOrCreateCustomer({ firstName, lastName, phoneNumber, email }) 
 
   const client = await pool.connect();
   try {
-    // cherche avec phone normalisé OU ancien format (si déjà en DB)
-    const existing = await client.query("SELECT id, phone FROM customers WHERE phone=$1 OR phone=$2 LIMIT 1", [
-      phone,
-      phoneNumber,
-    ]);
+    const existing = await client.query(
+      "SELECT id, phone FROM customers WHERE phone=$1 OR phone=$2 LIMIT 1",
+      [phone, phoneNumber]
+    );
 
     if (existing.rowCount > 0) {
       const id = existing.rows[0].id;
       const storedPhone = existing.rows[0].phone;
-      // si l’ancien format est stocké, on le corrige
       if (storedPhone !== phone) {
         await client.query("UPDATE customers SET phone=$2 WHERE id=$1", [id, phone]);
       }
@@ -359,14 +365,31 @@ async function createBookingRow({ bookingId, salonId, customerId, service, appoi
   return { totalPriceEur: total, depositRequiredEur: deposit };
 }
 
-// SMS templates
-function applyTemplate(tpl, vars) {
-  return String(tpl || "").replace(/\{(\w+)\}/g, (_, k) => (vars[k] ?? ""));
+/** =========================================================
+ *  10) SMS: schedule reminders + instant confirmations
+ *  ========================================================= */
+
+// Envoi Twilio immédiat (utilisé par confirmations)
+async function sendSmsNow(to, body) {
+  if (!twilio || !TWILIO_FROM_NUMBER) return;
+  const toNorm = normalizeBePhone(to);
+  if (!toNorm) return;
+
+  // sécurité: évite To == From
+  if (normalizeBePhone(TWILIO_FROM_NUMBER) === toNorm) {
+    throw new Error("'To' and 'From' number cannot be the same");
+  }
+
+  await twilio.messages.create({
+    from: TWILIO_FROM_NUMBER,
+    to: toNorm,
+    body,
+  });
 }
 
 async function scheduleSmsJobs(bookingId) {
   const { rows } = await pool.query(
-    `SELECT b.id, b.appointment_at, c.phone, c.first_name, b.service_name
+    `SELECT b.id, b.appointment_at, c.phone, c.first_name, c.last_name, b.service_name, b.deposit_required_eur
      FROM bookings b
      JOIN customers c ON c.id=b.customer_id
      WHERE b.id=$1`,
@@ -374,7 +397,7 @@ async function scheduleSmsJobs(bookingId) {
   );
   if (!rows[0]) return;
 
-  const appointmentAt = rows[0].appointment_at; // JS Date (pg)
+  const appointmentAt = rows[0].appointment_at; // JS Date
   const phone = normalizeBePhone(rows[0].phone);
   const firstName = rows[0].first_name || "";
   const serviceName = rows[0].service_name || "Rendez-vous";
@@ -402,14 +425,91 @@ async function scheduleSmsJobs(bookingId) {
   const msgH5 = applyTemplate(tplH5, vars);
 
   await pool.query(
-    `INSERT INTO sms_jobs (booking_id, phone, message, send_at, status)
-     VALUES ($1,$2,$3,$4,'PENDING')`,
+    `INSERT INTO sms_jobs (booking_id, phone, message, send_at, status, kind)
+     VALUES ($1,$2,$3,$4,'PENDING','REMINDER_J1')`,
     [bookingId, phone, msgJ1, remind1]
   );
   await pool.query(
-    `INSERT INTO sms_jobs (booking_id, phone, message, send_at, status)
-     VALUES ($1,$2,$3,$4,'PENDING')`,
+    `INSERT INTO sms_jobs (booking_id, phone, message, send_at, status, kind)
+     VALUES ($1,$2,$3,$4,'PENDING','REMINDER_H5')`,
     [bookingId, phone, msgH5, remind2]
+  );
+}
+
+async function sendInstantConfirmationSms(bookingId) {
+  // anti-doublon : si déjà envoyé, stop
+  const already = await pool.query(
+    "SELECT 1 FROM sms_jobs WHERE booking_id=$1 AND kind IN ('CONFIRM_CUSTOMER','CONFIRM_SALON') LIMIT 1",
+    [bookingId]
+  );
+  if (already.rowCount > 0) return;
+
+  const { rows } = await pool.query(
+    `SELECT b.id, b.appointment_at, b.service_name, b.deposit_required_eur,
+            c.first_name, c.last_name, c.phone
+     FROM bookings b
+     JOIN customers c ON c.id=b.customer_id
+     WHERE b.id=$1
+     LIMIT 1`,
+    [bookingId]
+  );
+  if (!rows[0]) return;
+
+  const r = rows[0];
+  const appt = DateTime.fromJSDate(r.appointment_at, { zone: "Europe/Brussels" });
+
+  const vars = {
+    bookingId: r.id,
+    firstName: r.first_name || "",
+    lastName: r.last_name || "",
+    phone: normalizeBePhone(r.phone || ""),
+    service: r.service_name || "Rendez-vous",
+    date: appt.toFormat("dd/LL/yyyy"),
+    time: appt.toFormat("HH:mm"),
+    address: "Rue des Capucins 64, 7000 Mons",
+    deposit: moneyEUR(r.deposit_required_eur),
+  };
+
+  const tplCustomer =
+    process.env.SMS_TEMPLATE_CONFIRM_CUSTOMER ||
+    "4D FASHION SERVICES SRL ✅ Réservation confirmée : {service} le {date} à {time}. Adresse : {address}. Merci {firstName} !";
+
+  const tplSalon =
+    process.env.SMS_TEMPLATE_CONFIRM_SALON ||
+    "📌 NOUVELLE RÉSERVATION : {firstName} {lastName} ({phone}) • {service} • {date} {time} • Acompte : {deposit} • Booking: {bookingId}";
+
+  const msgCustomer = applyTemplate(tplCustomer, vars);
+  const msgSalon = applyTemplate(tplSalon, vars);
+
+  // Envoi client
+  let customerError = null;
+  try {
+    await sendSmsNow(vars.phone, msgCustomer);
+  } catch (e) {
+    customerError = e?.message || String(e);
+    console.error("Instant customer SMS failed:", customerError);
+  }
+
+  // Envoi salon
+  let salonError = null;
+  try {
+    await sendSmsNow(SALON_NOTIFY_PHONE, msgSalon);
+  } catch (e) {
+    salonError = e?.message || String(e);
+    console.error("Instant salon SMS failed:", salonError);
+  }
+
+  // Log en DB (traçabilité)
+  await pool.query(
+    `INSERT INTO sms_jobs (booking_id, phone, message, send_at, status, sent_at, kind, error)
+     VALUES ($1,$2,$3, now(), $4, CASE WHEN $4='SENT' THEN now() ELSE NULL END, 'CONFIRM_CUSTOMER', $5)`,
+    [bookingId, vars.phone, msgCustomer, customerError ? "FAILED" : "SENT", customerError]
+  );
+
+  await pool.query(
+    `INSERT INTO sms_jobs (booking_id, phone, message, send_at, status, sent_at, kind, error)
+     VALUES ($1,$2,$3, now(), $4, CASE WHEN $4='SENT' THEN now() ELSE NULL END, 'CONFIRM_SALON', $5)`,
+    [bookingId, normalizeBePhone(SALON_NOTIFY_PHONE), msgSalon, salonError ? "FAILED" : "SENT", salonError]
   );
 }
 
@@ -423,14 +523,21 @@ async function markBookingConfirmed(bookingId, { stripeSessionId } = {}) {
     [bookingId, BookingStatus.CONFIRMED, stripeSessionId || null]
   );
 
-  const check = await pool.query("SELECT 1 FROM sms_jobs WHERE booking_id=$1 LIMIT 1", [bookingId]);
+  // Planifier rappels
+  const check = await pool.query(
+    "SELECT 1 FROM sms_jobs WHERE booking_id=$1 AND kind IN ('REMINDER_J1','REMINDER_H5') LIMIT 1",
+    [bookingId]
+  );
   if (check.rowCount === 0) {
     await scheduleSmsJobs(bookingId);
   }
+
+  // ✅ Confirmation immédiate client + salon
+  await sendInstantConfirmationSms(bookingId);
 }
 
 /** =========================================================
- *  10) SMS worker (cron every minute)
+ *  11) SMS worker (cron every minute) for reminders
  *  ========================================================= */
 async function sendPendingSmsJobs() {
   if (!twilio || !TWILIO_FROM_NUMBER) return;
@@ -470,7 +577,7 @@ cron.schedule("* * * * *", () => {
 });
 
 /** =========================================================
- *  11) Routes
+ *  12) Routes
  *  ========================================================= */
 app.get("/", (req, res) => res.send("4D Fashion Booking API en ligne 🚀"));
 
@@ -487,7 +594,6 @@ app.get("/health", async (req, res) => {
   });
 });
 
-// Services list (only active)
 app.get("/api/services", async (req, res) => {
   const { rows } = await pool.query(`
     SELECT 
@@ -597,8 +703,15 @@ app.get("/payments/paypal/return", async (req, res) => {
         BookingStatus.CONFIRMED,
       ]);
 
-      const check = await pool.query("SELECT 1 FROM sms_jobs WHERE booking_id=$1 LIMIT 1", [bookingId]);
+      // Planifier rappels si pas déjà là
+      const check = await pool.query(
+        "SELECT 1 FROM sms_jobs WHERE booking_id=$1 AND kind IN ('REMINDER_J1','REMINDER_H5') LIMIT 1",
+        [bookingId]
+      );
       if (check.rowCount === 0) await scheduleSmsJobs(bookingId);
+
+      // ✅ SMS instantané client + salon
+      await sendInstantConfirmationSms(bookingId);
 
       const redirectUrl = `${FRONTEND_SUCCESS_URL || API_BASE + "/success"}?bookingId=${encodeURIComponent(bookingId)}`;
       return res.redirect(302, redirectUrl);
@@ -623,7 +736,7 @@ app.get("/payments/paypal/cancel", async (req, res) => {
 });
 
 /** =========================================================
- *  12) Success / Cancel HTML pages (deep link only)
+ *  13) Success / Cancel HTML pages (deep link only)
  *  ========================================================= */
 app.get("/success", async (req, res) => {
   const bookingId = (req.query.bookingId || "").toString().trim();
@@ -633,7 +746,6 @@ app.get("/success", async (req, res) => {
     const { rows } = await pool.query(
       `SELECT 
           b.id,
-          b.status,
           b.deposit_paid AS "depositPaid",
           b.payment_method AS "paymentMethod",
           b.service_name AS "serviceName",
@@ -660,31 +772,7 @@ app.get("/cancel", async (req, res) => {
   const bookingId = (req.query.bookingId || "").toString().trim();
   if (!bookingId) return res.status(200).send("<h2>Paiement annulé ❌</h2>");
 
-  try {
-    const { rows } = await pool.query(
-      `SELECT 
-          b.id,
-          b.status,
-          b.deposit_paid AS "depositPaid",
-          b.payment_method AS "paymentMethod",
-          b.service_name AS "serviceName",
-          b.total_price_eur::float8 AS "totalPriceEur",
-          b.deposit_required_eur::float8 AS "depositRequiredEur",
-          b.appointment_at AS "appointmentAt",
-          c.first_name AS "firstName",
-          c.last_name AS "lastName",
-          c.phone AS "phone"
-       FROM bookings b
-       JOIN customers c ON c.id = b.customer_id
-       WHERE b.id = $1
-       LIMIT 1`,
-      [bookingId]
-    );
-    return res.status(200).send(renderCancelHtml({ bookingId, booking: rows[0] || null }));
-  } catch (e) {
-    console.error("cancel page error:", e);
-    return res.status(200).send(renderCancelHtml({ bookingId, booking: null, error: "Impossible de charger la réservation." }));
-  }
+  return res.status(200).send(renderCancelHtml({ bookingId }));
 });
 
 function renderSuccessHtml({ bookingId, booking, error }) {
@@ -754,21 +842,16 @@ function openApp(e){
 </body></html>`;
 }
 
-function renderCancelHtml({ bookingId, booking, error }) {
+function renderCancelHtml({ bookingId }) {
   const salonName = "4D FASHION SERVICES SRL";
   const address = "Rue des Capucins 64, 7000 Mons, Belgique";
-
-  const b = booking || {};
-  const appointment = b.appointmentAt ? formatBrusselsFromDate(b.appointmentAt) : "-";
-  const serviceName = b.serviceName ? escapeHtml(b.serviceName) : "-";
-  const safeId = bookingId ? escapeHtml(bookingId) : "-";
   const deepLink = bookingId ? `${APP_DEEP_LINK_SCHEME}${encodeURIComponent(bookingId)}` : "4dfashion://booking";
 
   return `<!doctype html><html lang="fr"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>${salonName} — Paiement annulé</title>
 <style>
-:root{--bg:#070A12;--card:#0D1224;--cyan:#00FFF0;--purple:#8B5CF6;--pink:#FF4ECD;--text:#EAFBFF;--muted:#9AA4BF;}
+:root{--bg:#070A12;--cyan:#00FFF0;--purple:#8B5CF6;--pink:#FF4ECD;--text:#EAFBFF;--muted:#9AA4BF;}
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;
 background:radial-gradient(900px 600px at 20% 15%, rgba(0,255,240,.14), transparent 60%),
@@ -778,24 +861,15 @@ radial-gradient(900px 600px at 55% 90%, rgba(255,78,205,.10), transparent 60%), 
 .brand h1{margin:0;font-size:18px;color:var(--cyan);text-transform:uppercase;}
 .brand p{margin:6px 0 0;color:var(--muted);font-size:14px;}
 .hero{margin-top:14px;background:rgba(13,18,36,.96);border:1px solid rgba(255,78,205,.22);border-radius:18px;padding:16px;}
-.row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06);}
-.row:last-child{border-bottom:0}
-.k{color:var(--muted)} .v{font-weight:650}
 .btn{margin-top:14px;display:inline-block;padding:12px 14px;border-radius:14px;
 background:linear-gradient(90deg,var(--cyan),var(--purple),var(--pink));
 color:var(--bg);font-weight:800;text-decoration:none;}
-.err{margin-top:10px;color:#ffb0c0;font-size:13px;}
 </style></head>
 <body><div class="wrap">
   <div class="brand"><h1>${salonName}</h1><p>${address}</p></div>
   <div class="hero">
     <h2 style="margin:0;">Paiement annulé ❌</h2>
     <p style="color:var(--muted);margin:8px 0 0;">Votre rendez-vous n’est pas confirmé.</p>
-    ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
-    <div class="row"><div class="k">Réservation</div><div class="v">${safeId}</div></div>
-    <div class="row"><div class="k">Prestation</div><div class="v">${serviceName}</div></div>
-    <div class="row"><div class="k">Date & heure</div><div class="v">${escapeHtml(appointment)}</div></div>
-
     <a class="btn" href="${deepLink}" onclick="openApp(event)">Retour à l’application</a>
   </div>
 </div>
@@ -810,26 +884,6 @@ function openApp(e){
 </script>
 </body></html>`;
 }
-
-/** =========================================================
- *  13) Admin endpoint example (optional)
- *  ========================================================= */
-function requireAdmin(req, res, next) {
-  const token = req.headers["x-admin-token"];
-  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(401).json({ error: "Unauthorized" });
-  next();
-}
-app.get("/api/admin/bookings", requireAdmin, async (req, res) => {
-  const { rows } = await pool.query(
-    `SELECT b.id, b.status, b.deposit_paid AS "depositPaid",
-            b.service_name AS "serviceName",
-            b.appointment_at AS "appointmentAt"
-     FROM bookings b
-     ORDER BY b.appointment_at DESC
-     LIMIT 200`
-  );
-  res.json(rows);
-});
 
 /** =========================================================
  *  14) Startup
