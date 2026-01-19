@@ -564,9 +564,13 @@ app.get("/health", async (req, res) => {
 
 app.get("/api/services", async (req, res) => {
   const { rows } = await pool.query(`
-    SELECT id, name, category,
-           price_eur::float8 AS "priceEur",
-           duration_minutes AS "durationMinutes"
+    SELECT 
+      id,
+      name,
+      category,
+      price_eur::float8 AS "priceEur",
+      duration_minutes AS "durationMinutes",
+      image_url AS "imageUrl"
     FROM services
     WHERE COALESCE(is_active, TRUE) = TRUE
     ORDER BY name ASC
